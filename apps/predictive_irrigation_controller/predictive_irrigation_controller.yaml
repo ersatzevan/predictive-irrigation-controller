@@ -1,0 +1,124 @@
+# ============================================================
+# Predictive Irrigation Controller — Example Configuration
+# Copy relevant sections into your AppDaemon apps.yaml
+# ============================================================
+
+predictive_irrigation_controller:
+  module: predictive_irrigation_controller
+  class: PredictiveIrrigationController
+
+  # ── SENSORS ────────────────────────────────────────────────
+  # Air temperature sensor (required)
+  temp_sensor: sensor.outdoor_temperature
+
+  # Soil temperature sensor for root-zone feed-forward (optional)
+  # Falls back to air temp if unavailable or not configured
+  # soil_temp_sensor: sensor.soil_temperature
+
+  # Weather entity for current conditions check
+  weather_entity: weather.forecast_home
+
+  # Rain probability forecast sensor (0.0–1.0 scale)
+  rain_prob_sensor: sensor.forecast_precipitation_probability
+
+  # Daily rain accumulation sensor (inches)
+  rain_day_sensor: sensor.daily_rain
+
+  # ── SCHEDULING ─────────────────────────────────────────────
+  # Sunrise-based scheduling (recommended)
+  # Watering finishes this many minutes before sunrise
+  sunrise_offset_minutes: 15
+
+  # Fallback fixed start time if sunrise calculation fails
+  fallback_run_time: "05:30:00"
+
+  # ── MOISTURE SENSORS ───────────────────────────────────────
+  # Set to true once sensors are installed and reading correctly
+  require_moisture_sensors: false
+
+  # Default moisture % to assume when sensors are unavailable
+  # Only used when require_moisture_sensors is false
+  default_moisture: 30
+
+  # ── RAIN THRESHOLDS ────────────────────────────────────────
+  # Skip watering if daily rain exceeds this (inches)
+  rain_today_threshold: 0.5
+
+  # ── NOTIFICATIONS ──────────────────────────────────────────
+  # HA notify service — e.g. notify/ntfy, notify/mobile_app
+  notify_service: "notify/notify"
+
+  # ── HARDWARE ───────────────────────────────────────────────
+  # Seconds between closing one valve and opening the next
+  # Increase if your gateway needs more RF recovery time
+  overlap_seconds: 10
+
+  # Minutes per zone when force run button is pressed
+  force_run_duration: 10
+
+  # ── OPTIONAL FEATURES ──────────────────────────────────────
+  # Emergency evening water check
+  # Fires if morning was skipped AND hot AND dry AND no rain
+  emergency_check_time: "16:00:00"
+  emergency_temp_threshold: 85.0       # °F
+  emergency_moisture_threshold: 40.0   # %
+  emergency_duration_pct: 0.5          # fraction of normal duration
+
+  # Overnight rain watchdog
+  # Runs before watering to decay integrals if significant rain fell
+  rain_watchdog_time: "05:00:00"
+  rain_watchdog_threshold: 0.5         # inches
+
+  # ── ZONES ──────────────────────────────────────────────────
+  # Add one entry per irrigation zone.
+  # Zone IDs can be any string: "1", "front", "roses", etc.
+  zones:
+    "1":
+      # Soil moisture sensor entity ID
+      moisture_sensor: sensor.soil_moisture_zone_1
+
+      # LinkTap / valve switch entity ID
+      valve_switch: switch.zone_1_valve
+
+      # Target moisture level (%)
+      setpoint: 60
+
+      # Proportional gain — higher = more aggressive response to deficit
+      kp: 1.5
+
+      # Integral gain — higher = faster accumulation of deficit memory
+      ki: 0.3
+
+      # Maximum watering duration (minutes)
+      max_duration: 60
+
+      # Minimum watering duration (minutes)
+      min_duration: 5
+
+      # Moisture level below which recovery is flagged as failed (%)
+      recovery_threshold: 40
+
+      # Minutes after valve close to check moisture recovery
+      recovery_delay_minutes: 60
+
+    "2":
+      moisture_sensor: sensor.soil_moisture_zone_2
+      valve_switch: switch.zone_2_valve
+      setpoint: 60
+      kp: 1.5
+      ki: 0.3
+      max_duration: 45
+      min_duration: 5
+      recovery_threshold: 40
+      recovery_delay_minutes: 60
+
+    "3":
+      moisture_sensor: sensor.soil_moisture_zone_3
+      valve_switch: switch.zone_3_valve
+      setpoint: 55
+      kp: 1.5
+      ki: 0.3
+      max_duration: 45
+      min_duration: 5
+      recovery_threshold: 40
+      recovery_delay_minutes: 60
