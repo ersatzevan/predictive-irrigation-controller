@@ -57,19 +57,64 @@ This controller asks: *how dry is the soil, how long has it been dry, and how mu
 
 ## Installation
 
-### Via HACS (Recommended)
+There are three ways to install depending on how you run AppDaemon.
+
+---
+
+### Option A — HA Add-on AppDaemon (easiest, most common)
+
+If you installed AppDaemon via the HA Add-on Store, HACS handles everything automatically.
 
 1. Open HACS in Home Assistant
 2. Click the three-dot menu → **Custom repositories**
-3. Add `https://github.com/YOURUSERNAME/predictive-irrigation-controller` as **AppDaemon** type
-4. Search for **Predictive Irrigation Controller** and install
-5. Restart AppDaemon
+3. Add `https://github.com/ersatzevan/predictive-irrigation-controller` as **AppDaemon** type
+4. Search for **Predictive Irrigation Controller** and click **Download**
+5. Add config to your `apps.yaml` (see [Setup](#setup) below)
+6. Restart AppDaemon add-on
 
-### Manual
+That's it — no SSH, no file copying.
 
-1. Copy `apps/predictive_irrigation_controller/` to your AppDaemon apps directory
-2. Merge the example config into your `apps.yaml`
-3. Restart AppDaemon
+---
+
+### Option B — Docker AppDaemon (one-time setup required)
+
+HACS installs files into the HA config directory, but Docker AppDaemon has its own separate directory. A one-time volume mount fix lets HACS and AppDaemon stay in sync automatically after that.
+
+**Step 1 — Find your AppDaemon compose file** and add a second volume mount:
+
+```yaml
+services:
+  appdaemon:
+    volumes:
+      - /your/appdaemon/conf:/conf                          # existing
+      - /your/ha/config/appdaemon/apps:/conf/apps/hacs      # add this
+```
+
+Replace `/your/appdaemon/conf` and `/your/ha/config` with your actual paths.
+
+**Step 2 — Tell AppDaemon to scan the HACS directory** by adding to `appdaemon.yaml`:
+
+```yaml
+appdaemon:
+  app_dir: /conf/apps
+  extra_app_paths:
+    - /conf/apps/hacs
+```
+
+**Step 3 — Redeploy the AppDaemon container**, then install via HACS as in Option A.
+
+After this one-time setup, any future HACS AppDaemon apps install automatically without touching Docker again.
+
+---
+
+### Option C — Manual Install (no HACS)
+
+1. Download or clone this repo
+2. Copy `apps/predictive_irrigation_controller/` to your AppDaemon apps directory
+3. Add config to your `apps.yaml` (see [Setup](#setup) below)
+4. Restart AppDaemon
+
+---
 
 ---
 
