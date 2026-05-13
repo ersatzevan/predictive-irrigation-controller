@@ -62,7 +62,7 @@ MQTT DASHBOARD:
     Import the example dashboard from the /docs/ folder.
 
 LICENSE: MIT
-AUTHOR:  github.com/YOURUSERNAME
+AUTHOR:  github.com/ersatzevan
 """
 
 import appdaemon.plugins.hass.hassapi as hass
