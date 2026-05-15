@@ -64,6 +64,13 @@ MQTT DASHBOARD:
     Import the example dashboard from the /docs/ folder.
 
 CHANGELOG:
+    v5:
+    - FIX: Removed dual-open race condition on sequential zones. The schedule's
+           30-second inter-zone gap is the RF gap. open_next_zone_after_gap was
+           firing 20s before open_valve_scheduled on the next zone, opening it
+           without a hardware timer or watchdog, then open_valve_scheduled opened
+           it again properly. Removed the chaining mechanism entirely — the
+           scheduler is now the sole sequencer.
     v4:
     - FIX: handle_valve_cutoff now checks active_valves before acting — stale
            watchdog listeners from a previous crashed or double-run session are
@@ -275,16 +282,12 @@ class PredictiveIrrigationController(hass.Hass):
         self.pending_zone_handles.clear()
 
         for i, (delay, zone_id, config, duration) in enumerate(schedule):
-            next_valve   = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
-            next_zone_id = schedule[i + 1][1]                if i + 1 < len(schedule) else None
             handle = self.run_in(
                 self.open_valve_scheduled,
                 delay,
                 zone_id=zone_id,
                 config=config,
                 duration=duration,
-                next_valve_switch=next_valve,
-                next_zone_id=next_zone_id,
             )
             self.pending_zone_handles.append(handle)
             self.log(f"Zone {zone_id}: scheduled in {delay // 60}min {delay % 60}s for {duration}min")
@@ -428,8 +431,6 @@ class PredictiveIrrigationController(hass.Hass):
         moisture_sensor     = config["moisture_sensor"]
         recovery_threshold  = float(config.get("recovery_threshold", 40))
         recovery_delay_mins = int(config.get("recovery_delay_minutes", 60))
-        next_valve_switch   = kwargs.get("next_valve_switch")
-        next_zone_id        = kwargs.get("next_zone_id")
 
         moisture_raw    = self.get_state(moisture_sensor)
         moisture_before = float(moisture_raw) if moisture_raw not in (None, "unavailable", "unknown") else self.default_moisture
@@ -456,7 +457,6 @@ class PredictiveIrrigationController(hass.Hass):
             zone_id=zone_id, valve_open_time=valve_open_time,
             scheduled_duration=duration, moisture_sensor=moisture_sensor,
             recovery_threshold=recovery_threshold, recovery_delay_mins=recovery_delay_mins,
-            next_valve_switch=next_valve_switch, next_zone_id=next_zone_id,
         )
 
         # Schedule close timer — store handle so cancel run and cutoff watchdog can abort it
@@ -469,8 +469,6 @@ class PredictiveIrrigationController(hass.Hass):
             recovery_threshold=recovery_threshold,
             moisture_before=moisture_before,
             recovery_delay_minutes=recovery_delay_mins,
-            next_valve_switch=next_valve_switch,
-            next_zone_id=next_zone_id,
         )
 
         self.active_valves[zone_id] = {
@@ -492,8 +490,6 @@ class PredictiveIrrigationController(hass.Hass):
         recovery_threshold  = kwargs["recovery_threshold"]
         moisture_before     = kwargs["moisture_before"]
         recovery_delay_mins = kwargs.get("recovery_delay_minutes", 60)
-        next_valve_switch   = kwargs.get("next_valve_switch")
-        next_zone_id        = kwargs.get("next_zone_id")
 
         # Cancel watchdog — this is a normal close, not a cutoff
         if zone_id in self.active_valves:
@@ -508,19 +504,9 @@ class PredictiveIrrigationController(hass.Hass):
         self.call_service("switch/turn_off", entity_id=valve_switch)
         self.log(f"Zone {zone_id}: valve closed ({valve_switch})")
 
-        if next_valve_switch:
-            self.run_in(self.open_next_zone_after_gap, self.overlap_seconds,
-                        next_valve_switch=next_valve_switch, next_zone_id=next_zone_id)
-
         self.run_in(self.check_recovery, recovery_delay_mins * 60,
                     zone_id=zone_id, moisture_sensor=moisture_sensor,
                     recovery_threshold=recovery_threshold, moisture_before=moisture_before)
-
-    def open_next_zone_after_gap(self, kwargs):
-        next_valve_switch = kwargs["next_valve_switch"]
-        next_zone_id      = kwargs.get("next_zone_id", "?")
-        self.call_service("switch/turn_on", entity_id=next_valve_switch)
-        self.log(f"Zone {next_zone_id}: valve opened after {self.overlap_seconds}s gap")
 
     # ------------------------------------------------------------------
     # FLOW CUTOFF WATCHDOG
@@ -532,9 +518,6 @@ class PredictiveIrrigationController(hass.Hass):
         moisture_sensor     = kwargs["moisture_sensor"]
         recovery_threshold  = kwargs["recovery_threshold"]
         recovery_delay_mins = kwargs["recovery_delay_mins"]
-        next_valve_switch   = kwargs.get("next_valve_switch")
-        next_zone_id        = kwargs.get("next_zone_id")
-
         actual_seconds = (datetime.now() - valve_open_time).total_seconds()
         actual_minutes = round(actual_seconds / 60, 1)
         pct_delivered  = round(actual_seconds / (scheduled_duration * 60) * 100, 1)
@@ -602,9 +585,6 @@ class PredictiveIrrigationController(hass.Hass):
                        actual_duration_min=actual_minutes, pct_delivered=pct_delivered, cause=cause_str)
         self.mqtt_publish(f"{MQTT_TOPIC_BASE}/{zone_id}/status", "cutoff")
 
-        if next_valve_switch:
-            self.run_in(self.open_next_zone_after_gap, 10,
-                        next_valve_switch=next_valve_switch, next_zone_id=next_zone_id)
 
     # ------------------------------------------------------------------
     # RECOVERY CHECK
@@ -815,12 +795,9 @@ class PredictiveIrrigationController(hass.Hass):
             cumulative_delay += duration * 60 + 30
 
         for i, (delay, zone_id, config, duration) in enumerate(schedule):
-            next_valve   = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
-            next_zone_id = schedule[i + 1][1]                if i + 1 < len(schedule) else None
             self.run_in(
                 self.open_valve_scheduled, delay,
                 zone_id=zone_id, config=config, duration=duration,
-                next_valve_switch=next_valve, next_zone_id=next_zone_id,
             )
 
         def finalize_emergency(kw):
@@ -866,12 +843,9 @@ class PredictiveIrrigationController(hass.Hass):
         self.pending_zone_handles.clear()
 
         for i, (delay, zone_id, config, duration) in enumerate(schedule):
-            next_valve   = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
-            next_zone_id = schedule[i + 1][1]                if i + 1 < len(schedule) else None
             handle = self.run_in(
                 self.open_valve_scheduled, delay,
                 zone_id=zone_id, config=config, duration=duration,
-                next_valve_switch=next_valve, next_zone_id=next_zone_id,
             )
             self.pending_zone_handles.append(handle)
             self.log(f"Force run: Zone {zone_id} scheduled in {delay}s for {duration}min")
