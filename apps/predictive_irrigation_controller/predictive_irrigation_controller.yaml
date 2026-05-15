@@ -72,8 +72,15 @@ predictive_irrigation_controller:
   # ── ZONES ──────────────────────────────────────────────────
   # Add one entry per irrigation zone.
   # Zone IDs can be any string: "1", "front", "roses", etc.
+  #
+  # The optional `name` field customises MQTT sensor labels in HA.
+  # Without it sensors appear as "PI Zone 1 Moisture" etc.
+  # With it they appear as "PI Hydrangeas Moisture" etc.
   zones:
     "1":
+      # Human-readable name — used for MQTT sensor labels in HA (optional)
+      name: Hydrangeas
+
       # Soil moisture sensor entity ID
       moisture_sensor: sensor.soil_moisture_zone_1
 
@@ -102,6 +109,7 @@ predictive_irrigation_controller:
       recovery_delay_minutes: 60
 
     "2":
+      name: Zone 2
       moisture_sensor: sensor.soil_moisture_zone_2
       valve_switch: switch.zone_2_valve
       setpoint: 60
@@ -113,6 +121,7 @@ predictive_irrigation_controller:
       recovery_delay_minutes: 60
 
     "3":
+      name: Zone 3
       moisture_sensor: sensor.soil_moisture_zone_3
       valve_switch: switch.zone_3_valve
       setpoint: 55
