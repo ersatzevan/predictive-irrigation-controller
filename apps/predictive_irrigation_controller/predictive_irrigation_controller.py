@@ -33,7 +33,8 @@ FEATURES:
     ✓ Overnight rain watchdog with proportional integral decay
     ✓ Per-zone enable/disable via HA input_boolean
     ✓ Master enable/disable switch
-    ✓ Force run button
+    ✓ Force run button — bypasses PI, respects zone enables
+    ✓ Cancel run button — stops active valves and pending timers
     ✓ MQTT discovery — live dashboard sensors in HA
     ✓ Flow cutoff watchdog — detects unexpected valve termination
     ✓ Monthly structured JSONL logging for tuning analysis
@@ -55,11 +56,20 @@ HELPERS REQUIRED IN HA:
     Create these in Settings → Helpers:
     - input_boolean.garden_pi_controller_enabled  (Toggle — master on/off)
     - input_button.pi_force_run                   (Button — manual trigger)
+    - input_button.pi_cancel_run                  (Button — cancel active run)
     - input_boolean.pi_zone_1_enabled             (Toggle — per-zone, one per zone)
 
 MQTT DASHBOARD:
     After first run, entities appear under "Garden PI Controller" device in HA.
     Import the example dashboard from the /docs/ folder.
+
+CHANGELOG:
+    v2:
+    - FIX: check_emergency_water now respects per-zone enable toggles
+    - FIX: close_handle now tracked in active_valves so cutoff watchdog can
+           cancel the pending close timer on unexpected valve termination
+    - ADD: Cancel run support — input_button.pi_cancel_run closes active valves
+           and cancels all pending zone timers immediately
 
 LICENSE: MIT
 AUTHOR:  github.com/ersatzevan
@@ -85,29 +95,31 @@ class PredictiveIrrigationController(hass.Hass):
     def initialize(self):
         self.log("Predictive Irrigation Controller initializing...")
 
-        self.zones                       = self.args.get("zones", {})
-        self.notify_service              = self.args.get("notify_service", "notify/notify")
-        self.temp_sensor                 = self.args.get("temp_sensor", "sensor.outdoor_temperature")
-        self.soil_temp_sensor            = self.args.get("soil_temp_sensor", None)
-        self.weather_entity              = self.args.get("weather_entity", "weather.forecast_home")
-        self.rain_prob_sensor            = self.args.get("rain_prob_sensor", None)
-        self.rain_day_sensor             = self.args.get("rain_day_sensor", None)
-        self.rain_threshold              = float(self.args.get("rain_today_threshold", 0.5))
-        self.require_moisture_sensors    = self.args.get("require_moisture_sensors", True)
-        self.default_moisture            = float(self.args.get("default_moisture", 30))
-        self.sunrise_offset              = int(self.args.get("sunrise_offset_minutes", 15))
-        self.fallback_run_time           = self.args.get("fallback_run_time", "05:30:00")
-        self.overlap_seconds             = int(self.args.get("overlap_seconds", 10))
-        self.force_run_duration          = int(self.args.get("force_run_duration", 10))
-        self.emergency_check_time        = self.args.get("emergency_check_time", "16:00:00")
-        self.emergency_temp_threshold    = float(self.args.get("emergency_temp_threshold", 85.0))
+        self.zones                        = self.args.get("zones", {})
+        self.notify_service               = self.args.get("notify_service", "notify/notify")
+        self.temp_sensor                  = self.args.get("temp_sensor", "sensor.outdoor_temperature")
+        self.soil_temp_sensor             = self.args.get("soil_temp_sensor", None)
+        self.weather_entity               = self.args.get("weather_entity", "weather.forecast_home")
+        self.rain_prob_sensor             = self.args.get("rain_prob_sensor", None)
+        self.rain_day_sensor              = self.args.get("rain_day_sensor", None)
+        self.rain_threshold               = float(self.args.get("rain_today_threshold", 0.5))
+        self.require_moisture_sensors     = self.args.get("require_moisture_sensors", True)
+        self.default_moisture             = float(self.args.get("default_moisture", 30))
+        self.sunrise_offset               = int(self.args.get("sunrise_offset_minutes", 15))
+        self.fallback_run_time            = self.args.get("fallback_run_time", "05:30:00")
+        self.overlap_seconds              = int(self.args.get("overlap_seconds", 10))
+        self.force_run_duration           = int(self.args.get("force_run_duration", 10))
+        self.emergency_check_time         = self.args.get("emergency_check_time", "16:00:00")
+        self.emergency_temp_threshold     = float(self.args.get("emergency_temp_threshold", 85.0))
         self.emergency_moisture_threshold = float(self.args.get("emergency_moisture_threshold", 40.0))
-        self.emergency_duration_pct      = float(self.args.get("emergency_duration_pct", 0.5))
-        self.rain_watchdog_time          = self.args.get("rain_watchdog_time", "05:00:00")
-        self.rain_watchdog_threshold     = float(self.args.get("rain_watchdog_threshold", 0.5))
+        self.emergency_duration_pct       = float(self.args.get("emergency_duration_pct", 0.5))
+        self.rain_watchdog_time           = self.args.get("rain_watchdog_time", "05:00:00")
+        self.rain_watchdog_threshold      = float(self.args.get("rain_watchdog_threshold", 0.5))
 
-        # Track active valve sessions for cutoff watchdog
+        # Active valve tracking — {zone_id: {valve_switch, watchdog_handle, close_handle, ...}}
         self.active_valves = {}
+        # Pending run_in handles for scheduled zone opens (used by cancel run)
+        self.pending_zone_handles = []
 
         # MQTT discovery
         self.run_in(self.publish_mqtt_discovery, 10)
@@ -116,18 +128,19 @@ class PredictiveIrrigationController(hass.Hass):
         self.run_daily(self.plan_watering_day, "00:01:00")
         self.run_in(self.plan_watering_day, 30)
 
-        # Rain watchdog at 5 AM
+        # Rain watchdog at configured time (default 5 AM)
         self.run_daily(self.check_overnight_rain, self.rain_watchdog_time)
 
-        # Emergency check at 4 PM
+        # Emergency check at configured time (default 4 PM)
         self.run_daily(self.check_emergency_water, self.emergency_check_time)
 
-        # Startup safety check
+        # Startup safety
         self.run_in(self.startup_safety_check, 20)
         self.run_in(self._publish_idle_status, 15)
 
-        # Force run listener
-        self.listen_state(self.handle_force_run, "input_button.pi_force_run")
+        # Button listeners
+        self.listen_state(self.handle_force_run,  "input_button.pi_force_run")
+        self.listen_state(self.handle_cancel_run, "input_button.pi_cancel_run")
 
         self.log(f"Initialized. Sunrise-based scheduling for zones: {list(self.zones.keys())}")
 
@@ -157,8 +170,8 @@ class PredictiveIrrigationController(hass.Hass):
         )
 
         target_finish = sunrise_dt - timedelta(minutes=self.sunrise_offset)
-        start_dt = target_finish - timedelta(seconds=estimated_total_secs)
-        now = datetime.now()
+        start_dt      = target_finish - timedelta(seconds=estimated_total_secs)
+        now           = datetime.now()
 
         if start_dt < now:
             self.log("Calculated start is in the past — skipping today.")
@@ -223,10 +236,12 @@ class PredictiveIrrigationController(hass.Hass):
         total_mins = sum(d for _, _, _, d in schedule) + (len(schedule) - 1) * 0.5
         self.log(f"Watering schedule: {len(schedule)} zone(s), ~{total_mins:.0f} min total")
 
+        self.pending_zone_handles.clear()
+
         for i, (delay, zone_id, config, duration) in enumerate(schedule):
-            next_valve    = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
-            next_zone_id  = schedule[i + 1][1] if i + 1 < len(schedule) else None
-            self.run_in(
+            next_valve   = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
+            next_zone_id = schedule[i + 1][1]                if i + 1 < len(schedule) else None
+            handle = self.run_in(
                 self.open_valve_scheduled,
                 delay,
                 zone_id=zone_id,
@@ -235,7 +250,8 @@ class PredictiveIrrigationController(hass.Hass):
                 next_valve_switch=next_valve,
                 next_zone_id=next_zone_id,
             )
-            self.log(f"Zone {zone_id}: scheduled in {delay//60}min {delay%60}s for {duration}min")
+            self.pending_zone_handles.append(handle)
+            self.log(f"Zone {zone_id}: scheduled in {delay // 60}min {delay % 60}s for {duration}min")
 
         total_delay = cumulative_delay + 60
         self.run_in(lambda kw: self.mqtt_publish(f"{MQTT_CTRL_BASE}/status", "idle"), total_delay)
@@ -254,19 +270,29 @@ class PredictiveIrrigationController(hass.Hass):
             self.publish_zone_state(zone_id, {"status": "disabled"})
             return {"state": state, "should_water": False, "duration": 0}
 
-        moisture_sensor    = config["moisture_sensor"]
-        setpoint           = float(config.get("setpoint", 50))
-        kp                 = float(config.get("kp", 1.5))
-        ki                 = float(config.get("ki", 0.3))
-        max_duration       = int(config.get("max_duration", 60))
-        min_duration       = int(config.get("min_duration", 5))
+        if zone_enabled in (None, "unavailable", "unknown"):
+            # Entity not found — warn and treat as enabled so new deployments
+            # without helpers configured still water. Create the input_boolean
+            # in HA (Settings → Helpers) to gain explicit per-zone control.
+            self.log(
+                f"Zone {zone_id}: enable entity not found (state={zone_enabled}). "
+                f"Treating as ENABLED — create input_boolean.pi_zone_{zone_id}_enabled for control.",
+                level="WARNING",
+            )
+
+        moisture_sensor = config["moisture_sensor"]
+        setpoint        = float(config.get("setpoint", 50))
+        kp              = float(config.get("kp", 1.5))
+        ki              = float(config.get("ki", 0.3))
+        max_duration    = int(config.get("max_duration", 60))
+        min_duration    = int(config.get("min_duration", 5))
 
         # Emergency watered flag — reduce integral to prevent over-watering
         zone_st_check = state.get(zone_id, {})
         if zone_st_check.get("emergency_watered"):
             self.log(f"Zone {zone_id}: emergency water ran — reducing integral.")
             if zone_id in state:
-                state[zone_id]["integral"] = state[zone_id].get("integral", 0) * 0.5
+                state[zone_id]["integral"]        = state[zone_id].get("integral", 0) * 0.5
                 state[zone_id]["emergency_watered"] = False
 
         moisture_raw = self.get_state(moisture_sensor)
@@ -278,14 +304,14 @@ class PredictiveIrrigationController(hass.Hass):
                     self.log(f"Zone {zone_id}: sensor offline — using last known {moisture:.1f}%.", level="WARNING")
                     self.notify(
                         f"⚠️ Zone {zone_id} Sensor Offline",
-                        f"Using last known moisture: {moisture:.0f}%."
+                        f"Using last known moisture: {moisture:.0f}%.",
                     )
                 else:
                     moisture = self.default_moisture
                     self.log(f"Zone {zone_id}: sensor offline, no prior reading — using default {moisture}%.", level="WARNING")
                     self.notify(
                         f"⚠️ Zone {zone_id} Sensor Offline",
-                        f"No prior reading. Using default {moisture:.0f}%."
+                        f"No prior reading. Using default {moisture:.0f}%.",
                     )
             else:
                 moisture = self.default_moisture
@@ -369,7 +395,7 @@ class PredictiveIrrigationController(hass.Hass):
         next_valve_switch   = kwargs.get("next_valve_switch")
         next_zone_id        = kwargs.get("next_zone_id")
 
-        moisture_raw = self.get_state(moisture_sensor)
+        moisture_raw    = self.get_state(moisture_sensor)
         moisture_before = float(moisture_raw) if moisture_raw not in (None, "unavailable", "unknown") else self.default_moisture
 
         # Set hardware duration timer on LinkTap (dead-man switch)
@@ -388,28 +414,37 @@ class PredictiveIrrigationController(hass.Hass):
 
         # Register cutoff watchdog
         is_watering_sensor = valve_switch.replace("switch.", "binary_sensor.") + "_is_watering"
-        valve_open_time = datetime.now()
-        self.active_valves[zone_id] = {"valve_switch": valve_switch, "open_time": valve_open_time,
-                                        "scheduled_duration": duration, "watchdog_handle": None}
-        handle = self.listen_state(
+        valve_open_time    = datetime.now()
+        watchdog_handle    = self.listen_state(
             self.handle_valve_cutoff, is_watering_sensor, new="off",
             zone_id=zone_id, valve_open_time=valve_open_time,
             scheduled_duration=duration, moisture_sensor=moisture_sensor,
             recovery_threshold=recovery_threshold, recovery_delay_mins=recovery_delay_mins,
             next_valve_switch=next_valve_switch, next_zone_id=next_zone_id,
         )
-        self.active_valves[zone_id]["watchdog_handle"] = handle
 
-        close_delay = duration * 60
-        if next_valve_switch:
-            self.run_in(self.close_valve, close_delay, zone_id=zone_id, valve_switch=valve_switch,
-                        moisture_sensor=moisture_sensor, recovery_threshold=recovery_threshold,
-                        moisture_before=moisture_before, recovery_delay_minutes=recovery_delay_mins,
-                        next_valve_switch=next_valve_switch, next_zone_id=next_zone_id)
-        else:
-            self.run_in(self.close_valve, close_delay, zone_id=zone_id, valve_switch=valve_switch,
-                        moisture_sensor=moisture_sensor, recovery_threshold=recovery_threshold,
-                        moisture_before=moisture_before, recovery_delay_minutes=recovery_delay_mins)
+        # Schedule close timer — store handle so cancel run and cutoff watchdog can abort it
+        close_handle = self.run_in(
+            self.close_valve,
+            duration * 60,
+            zone_id=zone_id,
+            valve_switch=valve_switch,
+            moisture_sensor=moisture_sensor,
+            recovery_threshold=recovery_threshold,
+            moisture_before=moisture_before,
+            recovery_delay_minutes=recovery_delay_mins,
+            next_valve_switch=next_valve_switch,
+            next_zone_id=next_zone_id,
+        )
+
+        self.active_valves[zone_id] = {
+            "valve_switch":       valve_switch,
+            "open_time":          valve_open_time,
+            "scheduled_duration": duration,
+            "watchdog_handle":    watchdog_handle,
+            "close_handle":       close_handle,
+        }
+        self.log(f"Zone {zone_id}: watchdog registered on {is_watering_sensor}")
 
     # ------------------------------------------------------------------
     # VALVE CLOSE
@@ -424,6 +459,7 @@ class PredictiveIrrigationController(hass.Hass):
         next_valve_switch   = kwargs.get("next_valve_switch")
         next_zone_id        = kwargs.get("next_zone_id")
 
+        # Cancel watchdog — this is a normal close, not a cutoff
         if zone_id in self.active_valves:
             handle = self.active_valves[zone_id].get("watchdog_handle")
             if handle:
@@ -469,11 +505,19 @@ class PredictiveIrrigationController(hass.Hass):
 
         self.log(f"Zone {zone_id}: CUTOFF — ran {actual_minutes}min of {scheduled_duration}min ({pct_delivered}%)", level="WARNING")
 
+        # Clean up tracking — cancel both watchdog listener and close timer
         if zone_id in self.active_valves:
-            handle = self.active_valves[zone_id].get("watchdog_handle")
-            if handle:
+            entry = self.active_valves[zone_id]
+            wh = entry.get("watchdog_handle")
+            if wh:
                 try:
-                    self.cancel_listen_state(handle)
+                    self.cancel_listen_state(wh)
+                except Exception:
+                    pass
+            ch = entry.get("close_handle")
+            if ch:
+                try:
+                    self.cancel_timer(ch)
                 except Exception:
                     pass
             del self.active_valves[zone_id]
@@ -481,10 +525,10 @@ class PredictiveIrrigationController(hass.Hass):
         # Adjust integral proportionally
         state = self.load_state()
         if zone_id in state:
-            old_integral = float(state[zone_id].get("integral", 0.0))
+            old_integral    = float(state[zone_id].get("integral", 0.0))
             fraction_missed = 1.0 - (actual_seconds / (scheduled_duration * 60))
-            new_integral = old_integral - (old_integral * fraction_missed * 0.5)
-            state[zone_id]["integral"] = new_integral
+            new_integral    = old_integral - (old_integral * fraction_missed * 0.5)
+            state[zone_id]["integral"]        = new_integral
             state[zone_id]["cutoff_detected"] = True
             self.save_state(state)
 
@@ -553,18 +597,18 @@ class PredictiveIrrigationController(hass.Hass):
     # TEMPERATURE FEED-FORWARD
     # ------------------------------------------------------------------
     def get_temp_factor(self):
-        # Try soil temp first if configured
+        # Try soil temp sensor if configured
         if self.soil_temp_sensor:
             soil_raw = self.get_state(self.soil_temp_sensor)
             if soil_raw not in (None, "unavailable", "unknown"):
                 soil_temp = float(soil_raw)
-                if soil_temp >= 85: factor = 1.40
+                if   soil_temp >= 85: factor = 1.40
                 elif soil_temp >= 80: factor = 1.25
                 elif soil_temp >= 75: factor = 1.10
                 elif soil_temp >= 65: factor = 1.00
                 elif soil_temp >= 55: factor = 0.80
                 elif soil_temp >= 50: factor = 0.65
-                else: factor = 0.50
+                else:                 factor = 0.50
                 self.log(f"Soil temp feed-forward: {soil_temp:.1f}°F → ×{factor:.2f}")
                 return factor
 
@@ -598,7 +642,7 @@ class PredictiveIrrigationController(hass.Hass):
             rain_prob_raw = self.get_state(self.rain_prob_sensor)
             if rain_prob_raw not in (None, "unavailable", "unknown"):
                 if float(rain_prob_raw) >= 0.5:
-                    return f"rain probability at {float(rain_prob_raw)*100:.0f}%"
+                    return f"rain probability at {float(rain_prob_raw) * 100:.0f}%"
 
         if self.rain_day_sensor:
             rain_raw = self.get_state(self.rain_day_sensor)
@@ -630,16 +674,16 @@ class PredictiveIrrigationController(hass.Hass):
             if prob_raw not in (None, "unavailable", "unknown"):
                 prob = float(prob_raw)
                 if prob < 0.10:
-                    self.log(f"Rain watchdog: {rain_today:.2f}\" logged but forecast prob {prob*100:.0f}% — likely phantom rain.", level="WARNING")
-                    self.notify("⚠️ Possible Phantom Rain", f"Sensor logged {rain_today:.2f}\" but forecast was {prob*100:.0f}%. Skipping decay.")
+                    self.log(f"Rain watchdog: {rain_today:.2f}\" logged but forecast prob {prob * 100:.0f}% — likely phantom rain.", level="WARNING")
+                    self.notify("⚠️ Possible Phantom Rain", f"Sensor logged {rain_today:.2f}\" but forecast was {prob * 100:.0f}%. Skipping decay.")
                     self.log_event("phantom_rain_detected", rain_in=round(rain_today, 2), forecast_prob=round(prob, 2))
                     return
 
         # Scale decay by rain amount
-        if rain_today >= 2.0: decay_factor = 0.10
+        if   rain_today >= 2.0: decay_factor = 0.10
         elif rain_today >= 1.0: decay_factor = 0.25
         elif rain_today >= 0.5: decay_factor = 0.50
-        else: decay_factor = 0.75
+        else:                   decay_factor = 0.75
 
         state = self.load_state()
         for zone_id in self.zones:
@@ -649,7 +693,7 @@ class PredictiveIrrigationController(hass.Hass):
 
         self.save_state(state)
         self.notify("🌧️ Overnight Rain — Integral Adjusted",
-                    f"{rain_today:.2f}\" fell overnight. Zone integrals decayed to {decay_factor*100:.0f}%.")
+                    f"{rain_today:.2f}\" fell overnight. Zone integrals decayed to {decay_factor * 100:.0f}%.")
         self.log_event("rain_watchdog", rain_in=round(rain_today, 2), decay_factor=decay_factor)
 
     # ------------------------------------------------------------------
@@ -658,7 +702,7 @@ class PredictiveIrrigationController(hass.Hass):
     def check_emergency_water(self, kwargs):
         self.log("Emergency water check running...")
 
-        inhibit_reason = self.get_state(f"sensor.garden_pi_controller_pi_inhibit_reason")
+        inhibit_reason = self.get_state("sensor.garden_pi_controller_pi_inhibit_reason")
         morning_was_inhibited = (inhibit_reason not in ("none", None, "unknown"))
         if not morning_was_inhibited:
             return
@@ -674,8 +718,14 @@ class PredictiveIrrigationController(hass.Hass):
             if float(temp_raw) < self.emergency_temp_threshold:
                 return
 
+        # Check enabled zones for dryness
         zones_needing_water = []
         for zone_id, config in self.zones.items():
+            # Respect per-zone enable toggle
+            zone_enabled = self.get_state(f"input_boolean.pi_zone_{zone_id}_enabled")
+            if zone_enabled == "off":
+                self.log(f"Emergency check: Zone {zone_id} is disabled — skipping.")
+                continue
             moisture_raw = self.get_state(config["moisture_sensor"])
             if moisture_raw in (None, "unavailable", "unknown"):
                 zones_needing_water.append(zone_id)
@@ -686,11 +736,17 @@ class PredictiveIrrigationController(hass.Hass):
             return
 
         temp_display = f"{float(temp_raw):.0f}°F" if temp_raw not in (None, "unavailable", "unknown") else "unknown"
-        rain_display = f"{float(self.get_state(self.rain_day_sensor)):.2f}\"" if self.rain_day_sensor else "N/A"
+        rain_display = (
+            f"{float(self.get_state(self.rain_day_sensor)):.2f}\""
+            if self.rain_day_sensor
+            else "N/A"
+        )
 
-        self.notify("🚨 Emergency Evening Watering",
-                    f"Morning was skipped. Temp: {temp_display} | Rain: {rain_display}\n"
-                    f"Running {int(self.emergency_duration_pct * 100)}% duration on zones: {', '.join(zones_needing_water)}")
+        self.notify(
+            "🚨 Emergency Evening Watering",
+            f"Morning was skipped. Temp: {temp_display} | Rain: {rain_display}\n"
+            f"Running {int(self.emergency_duration_pct * 100)}% duration on zones: {', '.join(zones_needing_water)}"
+        )
 
         self.log_event("emergency_water_triggered", zones=zones_needing_water,
                        duration_pct=self.emergency_duration_pct)
@@ -698,63 +754,134 @@ class PredictiveIrrigationController(hass.Hass):
 
         schedule = []
         cumulative_delay = 0
-        state = self.load_state()
 
         for zone_id, config in self.zones.items():
             if zone_id not in zones_needing_water:
                 continue
-            max_dur = int(config.get("max_duration", 60))
-            min_dur = int(config.get("min_duration", 5))
+            max_dur  = int(config.get("max_duration", 60))
+            min_dur  = int(config.get("min_duration", 5))
             duration = max(min_dur, int(max_dur * self.emergency_duration_pct))
             schedule.append((cumulative_delay, zone_id, config, duration))
             cumulative_delay += duration * 60 + 30
 
         for i, (delay, zone_id, config, duration) in enumerate(schedule):
-            next_valve = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
-            next_zone_id = schedule[i + 1][1] if i + 1 < len(schedule) else None
-            self.run_in(self.open_valve_scheduled, delay, zone_id=zone_id, config=config,
-                        duration=duration, next_valve_switch=next_valve, next_zone_id=next_zone_id)
+            next_valve   = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
+            next_zone_id = schedule[i + 1][1]                if i + 1 < len(schedule) else None
+            self.run_in(
+                self.open_valve_scheduled, delay,
+                zone_id=zone_id, config=config, duration=duration,
+                next_valve_switch=next_valve, next_zone_id=next_zone_id,
+            )
 
-        def finalize_emergency(kwargs):
-            state = self.load_state()
-            for zone_id in zones_needing_water:
-                if zone_id not in state:
-                    state[zone_id] = {}
-                state[zone_id]["last_run"] = datetime.now().isoformat()
-                state[zone_id]["emergency_watered"] = True
-            self.save_state(state)
+        def finalize_emergency(kw):
+            s = self.load_state()
+            for zid in zones_needing_water:
+                if zid not in s:
+                    s[zid] = {}
+                s[zid]["last_run"]        = datetime.now().isoformat()
+                s[zid]["emergency_watered"] = True
+            self.save_state(s)
             self.mqtt_publish(f"{MQTT_CTRL_BASE}/status", "idle")
             self.mqtt_publish(f"{MQTT_CTRL_BASE}/inhibit_reason", "none")
 
         self.run_in(finalize_emergency, cumulative_delay + 60)
 
     # ------------------------------------------------------------------
-    # FORCE RUN
+    # FORCE RUN — input_button.pi_force_run
+    # Bypasses PI calculation; respects per-zone enable toggles.
     # ------------------------------------------------------------------
     def handle_force_run(self, entity, attribute, old, new, kwargs):
         self.log("Force run triggered.")
-        self.notify("🔧 PI Force Run", f"Running all enabled zones for {self.force_run_duration} min.")
-        self.mqtt_publish(f"{MQTT_CTRL_BASE}/status", "force_run")
 
         schedule = []
         cumulative_delay = 0
         for zone_id, config in self.zones.items():
             zone_enabled = self.get_state(f"input_boolean.pi_zone_{zone_id}_enabled")
             if zone_enabled == "off":
+                self.log(f"Force run: Zone {zone_id} is disabled — skipping.")
                 continue
             schedule.append((cumulative_delay, zone_id, config, self.force_run_duration))
             cumulative_delay += self.force_run_duration * 60 + 30
 
+        if not schedule:
+            self.log("Force run: no enabled zones to water.")
+            self.notify("🔧 PI Force Run", "No enabled zones to water.")
+            return
+
+        self.notify("🔧 PI Force Run",
+                    f"Running {len(schedule)} enabled zone(s) for {self.force_run_duration} min each.")
+        self.mqtt_publish(f"{MQTT_CTRL_BASE}/status", "force_run")
+        self.mqtt_publish(f"{MQTT_CTRL_BASE}/inhibit_reason", "force_run_active")
+
+        self.pending_zone_handles.clear()
+
         for i, (delay, zone_id, config, duration) in enumerate(schedule):
             next_valve   = schedule[i + 1][2]["valve_switch"] if i + 1 < len(schedule) else None
-            next_zone_id = schedule[i + 1][1] if i + 1 < len(schedule) else None
-            self.run_in(self.open_valve_scheduled, delay, zone_id=zone_id, config=config,
-                        duration=duration, next_valve_switch=next_valve, next_zone_id=next_zone_id)
+            next_zone_id = schedule[i + 1][1]                if i + 1 < len(schedule) else None
+            handle = self.run_in(
+                self.open_valve_scheduled, delay,
+                zone_id=zone_id, config=config, duration=duration,
+                next_valve_switch=next_valve, next_zone_id=next_zone_id,
+            )
+            self.pending_zone_handles.append(handle)
+            self.log(f"Force run: Zone {zone_id} scheduled in {delay}s for {duration}min")
 
         self.run_in(lambda kw: (
             self.mqtt_publish(f"{MQTT_CTRL_BASE}/status", "idle"),
             self.mqtt_publish(f"{MQTT_CTRL_BASE}/inhibit_reason", "none"),
         ), cumulative_delay + 60)
+
+    # ------------------------------------------------------------------
+    # CANCEL RUN — input_button.pi_cancel_run
+    # Cancels pending zone timers and closes any open valves immediately.
+    # ------------------------------------------------------------------
+    def handle_cancel_run(self, entity, attribute, old, new, kwargs):
+        self.log("Cancel run triggered.")
+
+        # Cancel pending open-valve timers
+        cancelled_pending = 0
+        for handle in list(self.pending_zone_handles):
+            try:
+                self.cancel_timer(handle)
+                cancelled_pending += 1
+            except Exception:
+                pass
+        self.pending_zone_handles.clear()
+
+        # Close active valves and cancel their associated timers/listeners
+        cancelled_active = 0
+        for zone_id, entry in list(self.active_valves.items()):
+            valve_switch = entry["valve_switch"]
+            wh = entry.get("watchdog_handle")
+            if wh:
+                try:
+                    self.cancel_listen_state(wh)
+                except Exception:
+                    pass
+            ch = entry.get("close_handle")
+            if ch:
+                try:
+                    self.cancel_timer(ch)
+                except Exception:
+                    pass
+            try:
+                self.call_service("switch/turn_off", entity_id=valve_switch)
+                self.mqtt_publish(f"{MQTT_TOPIC_BASE}/{zone_id}/status", "cancelled")
+                cancelled_active += 1
+            except Exception as e:
+                self.log(f"Cancel: could not close valve {valve_switch} — {e}", level="ERROR")
+
+        self.active_valves.clear()
+
+        self.mqtt_publish(f"{MQTT_CTRL_BASE}/status", "idle")
+        self.mqtt_publish(f"{MQTT_CTRL_BASE}/inhibit_reason", "cancelled_by_user")
+
+        self.log(f"Cancel complete: {cancelled_pending} pending timer(s) cancelled, {cancelled_active} active valve(s) closed.")
+        self.notify(
+            "🛑 PI Run Cancelled",
+            f"Cancelled {cancelled_pending} pending zone(s) and closed {cancelled_active} active valve(s)."
+        )
+        self.log_event("run_cancelled", cancelled_pending=cancelled_pending, cancelled_active=cancelled_active)
 
     # ------------------------------------------------------------------
     # STARTUP SAFETY CHECK
@@ -775,12 +902,19 @@ class PredictiveIrrigationController(hass.Hass):
     def publish_mqtt_discovery(self, kwargs):
         zone_names = {z: config.get("name", f"Zone {z}") for z, config in self.zones.items()}
 
+        device_block = {
+            "identifiers": ["pi_controller"],
+            "name":        "Garden PI Controller",
+            "model":       "Predictive Irrigation Controller",
+            "manufacturer":"HACS AppDaemon",
+        }
+
         ctrl_sensors = [
-            ("status",        "PI Controller Status", None, "mdi:robot"),
-            ("inhibit_reason","PI Inhibit Reason",    None, "mdi:cancel"),
-            ("last_run",      "PI Last Run",           None, "mdi:history"),
-            ("next_run",      "PI Next Run",           None, "mdi:clock-start"),
-            ("emergency_run", "PI Emergency Run",      None, "mdi:alert"),
+            ("status",         "PI Controller Status", None, "mdi:robot"),
+            ("inhibit_reason", "PI Inhibit Reason",    None, "mdi:cancel"),
+            ("last_run",       "PI Last Run",           None, "mdi:history"),
+            ("next_run",       "PI Next Run",           None, "mdi:clock-start"),
+            ("emergency_run",  "PI Emergency Run",      None, "mdi:alert"),
         ]
 
         for field, name, unit, icon in ctrl_sensors:
@@ -788,24 +922,22 @@ class PredictiveIrrigationController(hass.Hass):
             config = {
                 "name": name, "unique_id": unique_id,
                 "state_topic": f"{MQTT_CTRL_BASE}/{field}", "icon": icon,
-                "device": {"identifiers": ["pi_controller"], "name": "Garden PI Controller",
-                           "model": "Predictive Irrigation Controller", "manufacturer": "HACS AppDaemon"},
+                "device": device_block,
             }
             if unit:
                 config["unit_of_measurement"] = unit
-            topic = f"homeassistant/sensor/{unique_id}/config"
-            self.mqtt_publish(topic, json.dumps(config), retain=True)
+            self.mqtt_publish(f"homeassistant/sensor/{unique_id}/config", json.dumps(config), retain=True)
 
         zone_sensors = [
-            ("moisture",     "Moisture",      "%",   "moisture", "mdi:water-percent"),
-            ("setpoint",     "Setpoint",      "%",   None,       "mdi:target"),
-            ("error",        "Deficit",       "%",   None,       "mdi:minus-circle"),
-            ("integral",     "Integral",      "",    None,       "mdi:sigma"),
-            ("duration",     "Last Duration", "min", None,       "mdi:timer"),
-            ("temp_factor",  "Temp Factor",   "×",   None,       "mdi:thermometer"),
-            ("last_watered", "Last Watered",  "",    None,       "mdi:calendar-clock"),
-            ("status",       "Status",        "",    None,       "mdi:information"),
-            ("recovery_delta","Recovery Δ",   "%",   None,       "mdi:trending-up"),
+            ("moisture",      "Moisture",      "%",   "moisture", "mdi:water-percent"),
+            ("setpoint",      "Setpoint",      "%",   None,       "mdi:target"),
+            ("error",         "Deficit",       "%",   None,       "mdi:minus-circle"),
+            ("integral",      "Integral",      "",    None,       "mdi:sigma"),
+            ("duration",      "Last Duration", "min", None,       "mdi:timer"),
+            ("temp_factor",   "Temp Factor",   "×",   None,       "mdi:thermometer"),
+            ("last_watered",  "Last Watered",  "",    None,       "mdi:calendar-clock"),
+            ("status",        "Status",        "",    None,       "mdi:information"),
+            ("recovery_delta","Recovery Δ",    "%",   None,       "mdi:trending-up"),
         ]
 
         for zone_id in self.zones:
@@ -815,15 +947,13 @@ class PredictiveIrrigationController(hass.Hass):
                 config = {
                     "name": f"PI {name} {label}", "unique_id": unique_id,
                     "state_topic": f"{MQTT_TOPIC_BASE}/{zone_id}/{field}", "icon": icon,
-                    "device": {"identifiers": ["pi_controller"], "name": "Garden PI Controller",
-                               "model": "Predictive Irrigation Controller", "manufacturer": "HACS AppDaemon"},
+                    "device": device_block,
                 }
                 if unit:
                     config["unit_of_measurement"] = unit
                 if dev_class:
                     config["device_class"] = dev_class
-                topic = f"homeassistant/sensor/{unique_id}/config"
-                self.mqtt_publish(topic, json.dumps(config), retain=True)
+                self.mqtt_publish(f"homeassistant/sensor/{unique_id}/config", json.dumps(config), retain=True)
 
         self.log("MQTT discovery configs published.")
 
