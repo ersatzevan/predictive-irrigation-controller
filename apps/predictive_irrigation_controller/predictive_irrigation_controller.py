@@ -64,6 +64,20 @@ MQTT DASHBOARD:
     Import the example dashboard from the /docs/ folder.
 
 CHANGELOG:
+    v4:
+    - FIX: handle_valve_cutoff now checks active_valves before acting — stale
+           watchdog listeners from a previous crashed or double-run session are
+           detected and ignored rather than corrupting the integral
+    - FIX: fraction_missed clamped to [0.0, 1.0] — if the valve ran longer than
+           its scheduled duration the formula previously went negative, causing
+           the integral to increase instead of decrease
+    v3:
+    - FIX: plan_watering_day now cancels any previously scheduled run_controller
+           before rescheduling. Prevents double run when AppDaemon restarts before
+           midnight — the startup run_in(+30s) and the run_daily(00:01) both called
+           run_in(run_controller) independently, producing two full cycles at the
+           same time, double valve opens, double watchdogs, and compounding integral
+           adjustments.
     v2:
     - FIX: check_emergency_water now respects per-zone enable toggles
     - FIX: close_handle now tracked in active_valves so cutoff watchdog can
@@ -120,6 +134,10 @@ class PredictiveIrrigationController(hass.Hass):
         self.active_valves = {}
         # Pending run_in handles for scheduled zone opens (used by cancel run)
         self.pending_zone_handles = []
+        # Handle for the scheduled run_controller call — tracked so midnight
+        # re-planning can cancel the previous schedule before setting a new one,
+        # preventing a double run if AppDaemon restarts before midnight.
+        self._run_controller_handle = None
 
         # MQTT discovery
         self.run_in(self.publish_mqtt_discovery, 10)
@@ -161,7 +179,7 @@ class PredictiveIrrigationController(hass.Hass):
             if start_dt < now:
                 start_dt += timedelta(days=1)
             delay = (start_dt - now).total_seconds()
-            self.run_in(self.run_controller, delay)
+            self._schedule_run_controller(delay)
             return
 
         estimated_total_secs = sum(
@@ -179,7 +197,7 @@ class PredictiveIrrigationController(hass.Hass):
             return
 
         delay = (start_dt - now).total_seconds()
-        self.run_in(self.run_controller, delay)
+        self._schedule_run_controller(delay)
 
         self.log(
             f"Sunrise: {sunrise_dt.strftime('%H:%M')} | "
@@ -187,6 +205,24 @@ class PredictiveIrrigationController(hass.Hass):
             f"Watering starts: {start_dt.strftime('%H:%M')}"
         )
         self.mqtt_publish(f"{MQTT_CTRL_BASE}/next_run", start_dt.strftime("%Y-%m-%d %H:%M"))
+
+    # ------------------------------------------------------------------
+    # SAFE RUN_CONTROLLER SCHEDULING
+    # ------------------------------------------------------------------
+    def _schedule_run_controller(self, delay):
+        """
+        Cancels any previously scheduled run_controller call before
+        scheduling a new one. This prevents a double run when
+        plan_watering_day fires at both startup (run_in +30s) and again
+        at midnight (run_daily 00:01) with the same calculated start time.
+        """
+        if self._run_controller_handle is not None:
+            try:
+                self.cancel_timer(self._run_controller_handle)
+                self.log("Cancelled previous run_controller schedule before rescheduling.")
+            except Exception:
+                pass
+        self._run_controller_handle = self.run_in(self.run_controller, delay)
 
     # ------------------------------------------------------------------
     # MAIN CONTROLLER LOOP
@@ -503,30 +539,44 @@ class PredictiveIrrigationController(hass.Hass):
         actual_minutes = round(actual_seconds / 60, 1)
         pct_delivered  = round(actual_seconds / (scheduled_duration * 60) * 100, 1)
 
+        # Guard: if this zone is no longer in active_valves it means the normal
+        # close_valve path already cleaned it up, or this is a stale listener
+        # from a previous crashed/double-run session. Ignore it entirely — acting
+        # on a stale watchdog produces wildly wrong runtime calculations and
+        # corrupts the integral in unpredictable directions.
+        if zone_id not in self.active_valves:
+            self.log(
+                f"Zone {zone_id}: stale cutoff watchdog fired ({actual_minutes}min elapsed, "
+                f"{scheduled_duration}min scheduled) — ignoring.",
+                level="WARNING",
+            )
+            return
+
         self.log(f"Zone {zone_id}: CUTOFF — ran {actual_minutes}min of {scheduled_duration}min ({pct_delivered}%)", level="WARNING")
 
         # Clean up tracking — cancel both watchdog listener and close timer
-        if zone_id in self.active_valves:
-            entry = self.active_valves[zone_id]
-            wh = entry.get("watchdog_handle")
-            if wh:
-                try:
-                    self.cancel_listen_state(wh)
-                except Exception:
-                    pass
-            ch = entry.get("close_handle")
-            if ch:
-                try:
-                    self.cancel_timer(ch)
-                except Exception:
-                    pass
-            del self.active_valves[zone_id]
+        entry = self.active_valves[zone_id]
+        wh = entry.get("watchdog_handle")
+        if wh:
+            try:
+                self.cancel_listen_state(wh)
+            except Exception:
+                pass
+        ch = entry.get("close_handle")
+        if ch:
+            try:
+                self.cancel_timer(ch)
+            except Exception:
+                pass
+        del self.active_valves[zone_id]
 
-        # Adjust integral proportionally
+        # Adjust integral — only penalise for what was NOT delivered.
+        # Clamp fraction_missed to [0, 1]: if actual > scheduled (valve ran
+        # longer than expected) the full duration was delivered so no penalty.
         state = self.load_state()
         if zone_id in state:
             old_integral    = float(state[zone_id].get("integral", 0.0))
-            fraction_missed = 1.0 - (actual_seconds / (scheduled_duration * 60))
+            fraction_missed = max(0.0, min(1.0, 1.0 - (actual_seconds / (scheduled_duration * 60))))
             new_integral    = old_integral - (old_integral * fraction_missed * 0.5)
             state[zone_id]["integral"]        = new_integral
             state[zone_id]["cutoff_detected"] = True
